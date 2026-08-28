@@ -63,6 +63,9 @@ impl Session {
         server: &str,
         tool: &str,
     ) -> Option<PreparedMcpCall> {
+        if self.services.mcp_runtime.reconnect_is_pending() {
+            self.mark_mcp_runtime_dirty();
+        }
         self.refresh_mcp_if_dirty().await;
         self.services
             .mcp_runtime

@@ -47,6 +47,7 @@ struct TestStep {
     step: Arc<McpBinding>,
     client: Arc<RmcpClient>,
     tool_catalog_revision: Arc<tokio::sync::RwLock<u64>>,
+    reconnect_pending: Arc<AtomicBool>,
 }
 
 async fn test_step(
@@ -98,6 +99,7 @@ async fn test_step(
     )])));
     let connections = Arc::new(McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true));
     let tool_catalog_revision = Arc::new(tokio::sync::RwLock::new(0));
+    let reconnect_pending = Arc::new(AtomicBool::new(false));
     let mut config = crate::mcp::tests::test_mcp_config(std::env::temp_dir());
     if label == "old" {
         config.approval_policy = Constrained::allow_any(AskForApproval::Never);
@@ -128,6 +130,7 @@ async fn test_step(
         },
         Some(format!("{label}-plugin")),
         label == "old",
+        Arc::clone(&reconnect_pending),
     )
     .expect("test call should retain its thread-owned permission profile");
     let calls = HashMap::from([((SERVER_NAME.to_string(), TOOL_NAME.to_string()), prepared)]);
@@ -143,6 +146,7 @@ async fn test_step(
         )),
         client,
         tool_catalog_revision,
+        reconnect_pending,
     }
 }
 
@@ -214,6 +218,7 @@ async fn prepared_call_keeps_captured_connection_and_authority_after_refresh() -
     );
     assert!(Arc::ptr_eq(&old_call.client.client, &old.client));
     assert!(!Arc::ptr_eq(&old.client, &new.client));
+    assert!(!old.reconnect_pending.load(Ordering::Acquire));
     assert_eq!(
         (
             old_call.config().approval_policy.value(),
@@ -281,6 +286,7 @@ async fn prepared_call_does_not_reroute_after_captured_connection_closes() {
         format!("{error:#}").contains("MCP client is shut down"),
         "the prepared call should fail on its captured client: {error:#}"
     );
+    assert!(old.reconnect_pending.load(Ordering::Acquire));
 }
 
 #[tokio::test]

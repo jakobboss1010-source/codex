@@ -229,6 +229,7 @@ async fn capture_binding(manager: &Arc<McpConnectionSet>) -> McpBinding {
             Arc::new(config),
             /*plugins_available*/ false,
             /*required_servers*/ &[],
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await
 }
@@ -522,6 +523,7 @@ async fn prepared_call_timeout_includes_trusted_access_lookup() {
         server_metadata,
         Some("docs@test".to_string()),
         /*selected_plugin_server*/ false,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .expect("docs should retain its permission profile");
 
@@ -2609,6 +2611,7 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
             Arc::new(plugin_config),
             /*plugins_available*/ false,
             /*required_servers*/ &[],
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ),
     )
     .await
@@ -2646,6 +2649,7 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
             Arc::new(crate::mcp::tests::test_mcp_config(std::env::temp_dir())),
             /*plugins_available*/ false,
             &required_servers,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ),
     )
     .await;
@@ -2678,6 +2682,7 @@ async fn capture_binding_waits_for_optional_startup_when_shared_grace_is_disable
                 Arc::new(config),
                 /*plugins_available*/ false,
                 /*required_servers*/ &[],
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .await
     });
@@ -2806,6 +2811,7 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
                 Arc::new(disabled_config),
                 /*plugins_available*/ false,
                 /*required_servers*/ &[],
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ),
         )
         .await
@@ -2833,6 +2839,7 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
             Arc::new(updated_config),
             /*plugins_available*/ false,
             /*required_servers*/ &[],
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ),
     )
     .await

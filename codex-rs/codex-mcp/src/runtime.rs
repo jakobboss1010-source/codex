@@ -92,7 +92,7 @@ pub struct McpRuntimeInput {
 pub struct McpRuntime {
     current: ArcSwap<PublishedMcpRuntime>,
     hosted_event_server_removals: watch::Sender<()>,
-    reconnect_pending: AtomicBool,
+    reconnect_pending: Arc<AtomicBool>,
     elicitation_router: ElicitationRequestRouter,
     resource_origins: Mutex<ResourceOrigins>,
 }
@@ -105,6 +105,7 @@ struct PublishedMcpRuntime {
     plugins_available: bool,
     ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
     selected_environments: HashMap<String, Arc<Environment>>,
+    reconnect_pending: Arc<AtomicBool>,
     cached_binding: Mutex<Option<CachedMcpBinding>>,
 }
 
@@ -167,6 +168,7 @@ impl McpRuntime {
     /// This is useful while constructing a thread that must publish a stable
     /// runtime handle before its full MCP inputs are available.
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
+        let reconnect_pending = Arc::new(AtomicBool::new(false));
         Self {
             current: ArcSwap::from_pointee(PublishedMcpRuntime {
                 connections: Arc::new(McpConnectionSet::empty(prefix_mcp_tool_names)),
@@ -176,10 +178,11 @@ impl McpRuntime {
                 plugins_available: false,
                 ready_selected_capability_roots: Vec::new(),
                 selected_environments: HashMap::new(),
+                reconnect_pending: Arc::clone(&reconnect_pending),
                 cached_binding: Mutex::new(None),
             }),
             hosted_event_server_removals: watch::channel(()).0,
-            reconnect_pending: AtomicBool::new(false),
+            reconnect_pending,
             elicitation_router: ElicitationRequestRouter::default(),
             resource_origins: Mutex::default(),
         }
@@ -299,6 +302,7 @@ impl McpRuntime {
             plugins_available,
             ready_selected_capability_roots,
             selected_environments,
+            reconnect_pending: Arc::clone(&self.reconnect_pending),
             cached_binding: Mutex::new(None),
         }));
         let _ = publish.send(true);
@@ -310,6 +314,11 @@ impl McpRuntime {
     /// Ensures the next refresh creates fresh connections for every configured server.
     pub fn reconnect_on_next_refresh(&self) {
         self.reconnect_pending.store(true, Ordering::Release);
+    }
+
+    /// Returns whether a failed call discovered that this runtime needs fresh connections.
+    pub fn reconnect_is_pending(&self) -> bool {
+        self.reconnect_pending.load(Ordering::Acquire)
     }
 
     /// Captures the latest published configuration and live client handles.
@@ -346,7 +355,12 @@ impl McpRuntime {
         let binding = Arc::new(
             current
                 .connections
-                .capture_binding_with_metadata(config, current.plugins_available, required_servers)
+                .capture_binding_with_metadata(
+                    config,
+                    current.plugins_available,
+                    required_servers,
+                    Arc::clone(&current.reconnect_pending),
+                )
                 .await,
         );
         if let Some(catalog_revision) = stable_catalog_revision
@@ -810,6 +824,7 @@ mod tests {
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
             selected_environments: HashMap::new(),
+            reconnect_pending: Arc::new(AtomicBool::new(false)),
             cached_binding: Mutex::new(None),
         });
         let first = McpRuntime::binding_from_published_runtime(

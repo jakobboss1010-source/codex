@@ -170,6 +170,7 @@ impl McpConnectionSet {
         config: Arc<crate::McpConfig>,
         plugins_available: bool,
         required_servers: &[String],
+        reconnect_pending: Arc<std::sync::atomic::AtomicBool>,
     ) -> McpBinding {
         let revision = self.tool_catalog_revision.read().await;
         let mut listed_tools = Vec::new();
@@ -309,8 +310,13 @@ impl McpConnectionSet {
                 }
                 continue;
             };
-            let Some(call) = self.prepare_call(&tool_info, client, Arc::clone(&config), *revision)
-            else {
+            let Some(call) = self.prepare_call(
+                &tool_info,
+                client,
+                Arc::clone(&config),
+                *revision,
+                Arc::clone(&reconnect_pending),
+            ) else {
                 trace!(
                     server_name = %tool_info.server_name,
                     tool_name = %tool_info.tool.name,
@@ -345,6 +351,7 @@ impl McpConnectionSet {
         client: Arc<ManagedClient>,
         config: Arc<crate::McpConfig>,
         tool_catalog_revision: u64,
+        reconnect_pending: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<PreparedMcpCall> {
         let server_name = &tool_info.server_name;
         let view = self.servers.get(server_name)?;
@@ -359,6 +366,7 @@ impl McpConnectionSet {
             self.plugin_id_for_mcp_server_name(server_name)
                 .map(str::to_string),
             self.is_selected_plugin_mcp_server(server_name),
+            reconnect_pending,
         )
     }
 

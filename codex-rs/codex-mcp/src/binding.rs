@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -180,6 +182,7 @@ pub struct PreparedMcpCall {
     server_metadata: McpServerMetadata,
     plugin_id: Option<String>,
     selected_plugin_server: bool,
+    reconnect_pending: Arc<AtomicBool>,
 }
 
 impl PreparedMcpCall {
@@ -197,6 +200,7 @@ impl PreparedMcpCall {
         server_metadata: McpServerMetadata,
         plugin_id: Option<String>,
         selected_plugin_server: bool,
+        reconnect_pending: Arc<AtomicBool>,
     ) -> Option<Self> {
         let server_name = tool_info.server_name.clone();
         config.permission_profile_for_server(&server_name)?;
@@ -211,6 +215,7 @@ impl PreparedMcpCall {
             server_metadata,
             plugin_id,
             selected_plugin_server,
+            reconnect_pending,
         })
     }
 
@@ -368,7 +373,11 @@ impl PreparedMcpCall {
             .client
             .call_tool(tool_name.clone(), arguments, meta, remaining_timeout)
             .await
-            .with_context(|| format!("tool call failed for `{}/{tool_name}`", self.server_name))?;
+            .with_context(|| format!("tool call failed for `{}/{tool_name}`", self.server_name));
+        if result.is_err() && self.client.client.is_closed().await {
+            self.reconnect_pending.store(true, Ordering::Release);
+        }
+        let result = result?;
         drop(current_revision);
         Ok(call_tool_result_from_rmcp(result))
     }

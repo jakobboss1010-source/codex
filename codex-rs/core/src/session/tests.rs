@@ -9163,6 +9163,25 @@ async fn cancelled_mcp_refresh_remains_pending() {
 }
 
 #[tokio::test]
+async fn pending_transport_reconnect_is_consumed_before_next_mcp_tool_call() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+
+    session.services.mcp_runtime.reconnect_on_next_refresh();
+    assert!(session.services.mcp_runtime.reconnect_is_pending());
+
+    assert!(
+        session
+            .prepare_mcp_call("missing-server", "missing-tool")
+            .await
+            .is_none()
+    );
+    assert!(!session.services.mcp_runtime.reconnect_is_pending());
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
 async fn mcp_elicitation_reviewer_is_reused_across_runtime_refreshes() {
     let (session, _turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
