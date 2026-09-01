@@ -138,6 +138,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         root_authorization.as_deref().unwrap_or_default(),
         &trusted_user_inputs,
     )?;
+    let transcript_entries = retain_current_action_envelope(transcript_entries);
     let transcript_cursor = GuardianTranscriptCursor {
         parent_history_version: history.review_history_version(),
         transcript_entry_count: transcript_entries.len(),
@@ -493,6 +494,33 @@ pub(super) fn collect_guardian_context(
     })
 }
 
+/// Keeps every transcript-level user/developer message and the evidence
+/// produced by the current user turn. Root authorization and trusted answers
+/// are composed separately and are therefore unaffected by this filter. Older
+/// assistant/tool traffic is not causal evidence for the pending action and
+/// needlessly grows every fresh Guardian review.
+pub(crate) fn retain_current_action_envelope(
+    entries: Vec<ConversationTranscriptEntry>,
+) -> Vec<ConversationTranscriptEntry> {
+    let latest_user = entries
+        .iter()
+        .rposition(|entry| entry.kind == ConversationTranscriptEntryKind::User);
+    let Some(latest_user) = latest_user else {
+        return entries;
+    };
+
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let retain = index >= latest_user
+                || entry.kind == ConversationTranscriptEntryKind::User
+                || entry.kind == ConversationTranscriptEntryKind::Developer;
+            retain.then_some(entry)
+        })
+        .collect()
+}
+
 struct GuardianReviewHistory<'a>(&'a dyn ConversationHistorySnapshot);
 
 impl SectionHistory for GuardianReviewHistory<'_> {
@@ -647,4 +675,86 @@ pub(super) fn guardian_policy_prompt_with_config_and_template(
         tenant_policy_config.trim(),
     );
     format!("{prompt}\n\n{}\n", guardian_output_contract_prompt())
+}
+
+/// Narrows an environment-profile destination catalog to the exact hosts in
+/// the pending action. General rules and hostless profile statements are kept.
+/// If no exact host match exists, the full policy is returned fail-safe.
+pub(crate) fn action_scoped_guardian_policy(policy: &str, planned_action_json: &str) -> String {
+    let action_hosts = extract_policy_hostnames(planned_action_json);
+    if action_hosts.is_empty() {
+        return policy.to_string();
+    }
+
+    let lines = policy.lines().collect::<Vec<_>>();
+    let Some(profile_start) = lines.iter().position(|line| {
+        line.trim_start().to_ascii_lowercase().starts_with("## ")
+            && line.to_ascii_lowercase().contains("environment profile")
+    }) else {
+        return policy.to_string();
+    };
+    let profile_end = lines
+        .iter()
+        .enumerate()
+        .skip(profile_start + 1)
+        .find_map(|(index, line)| line.trim_start().starts_with("## ").then_some(index))
+        .unwrap_or(lines.len());
+
+    let mut selected = Vec::with_capacity(lines.len());
+    selected.extend_from_slice(&lines[..=profile_start]);
+    let mut matched_destination = false;
+    let profile_lines = &lines[profile_start + 1..profile_end];
+    let mut index = 0;
+    while index < profile_lines.len() {
+        if !profile_lines[index].trim_start().starts_with("- ") {
+            selected.push(profile_lines[index]);
+            index += 1;
+            continue;
+        }
+
+        let block_end = profile_lines[index + 1..]
+            .iter()
+            .position(|line| line.trim_start().starts_with("- "))
+            .map_or(profile_lines.len(), |offset| index + 1 + offset);
+        let block = &profile_lines[index..block_end];
+        let policy_hosts = extract_policy_hostnames(&block.join("\n"));
+        if policy_hosts.is_empty() {
+            selected.extend_from_slice(block);
+        } else if policy_hosts.iter().any(|host| action_hosts.contains(host)) {
+            matched_destination = true;
+            selected.extend_from_slice(block);
+        }
+        index = block_end;
+    }
+    if !matched_destination {
+        return policy.to_string();
+    }
+    selected.extend_from_slice(&lines[profile_end..]);
+
+    let mut scoped = selected.join("\n");
+    if policy.ends_with('\n') {
+        scoped.push('\n');
+    }
+    scoped
+}
+
+fn extract_policy_hostnames(text: &str) -> std::collections::HashSet<String> {
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || character == '.' || character == '-')
+    })
+    .filter_map(|candidate| {
+        let candidate = candidate.trim_matches('.').to_ascii_lowercase();
+        let mut labels = candidate.split('.');
+        let first = labels.next()?;
+        let remaining = labels.collect::<Vec<_>>();
+        let last = remaining.last()?;
+        let valid = !first.is_empty()
+            && remaining.iter().all(|label| !label.is_empty())
+            && last.len() >= 2
+            && last
+                .chars()
+                .all(|character| character.is_ascii_alphabetic());
+        valid.then_some(candidate)
+    })
+    .collect()
 }

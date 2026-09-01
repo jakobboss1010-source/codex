@@ -57,7 +57,10 @@ use super::approval_request::guardian_request_target_item_id;
 use super::approval_request::guardian_request_turn_id;
 use super::approval_request::guardian_reviewed_action;
 use super::metrics::emit_guardian_review_metrics;
+use super::prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
+use super::prompt::action_scoped_guardian_policy;
 use super::prompt::guardian_output_schema;
+use super::prompt::guardian_policy_prompt_with_config_and_template;
 use super::prompt::parse_guardian_assessment;
 use super::review_session::GuardianReviewSessionOutcome;
 use super::review_session::GuardianReviewSessionParams;
@@ -835,6 +838,7 @@ pub(super) struct GuardianReviewSessionConfig {
 pub(super) async fn guardian_review_session_config(
     session: &Session,
     turn: &TurnContext,
+    request: Option<&GuardianApprovalRequest>,
 ) -> anyhow::Result<GuardianReviewSessionConfig> {
     let network_proxy = session.services.network_proxy.load_full();
     let live_network_config = match network_proxy.as_ref() {
@@ -909,6 +913,20 @@ pub(super) async fn guardian_review_session_config(
         guardian_reasoning_effort.clone(),
         guardian_model_info.model_messages.as_ref(),
     )?;
+    if let Some(request) = request {
+        let model_messages = guardian_model_info.model_messages.as_ref();
+        let full_policy = turn.config.resolve_guardian_policy(model_messages);
+        let planned_action_json = format_guardian_action_pretty(request)?;
+        let scoped_policy = action_scoped_guardian_policy(full_policy, &planned_action_json.text);
+        let policy_template = model_messages
+            .and_then(|messages| messages.auto_review.as_ref())
+            .and_then(|messages| messages.policy_template.as_deref())
+            .unwrap_or(BUNDLED_GUARDIAN_POLICY_TEMPLATE);
+        spawn_config.base_instructions = Some(guardian_policy_prompt_with_config_and_template(
+            &scoped_policy,
+            policy_template,
+        ));
+    }
     if turn.model_info().node_repl_auto_review_required {
         spawn_config
             .features
@@ -961,16 +979,17 @@ async fn run_guardian_review_session_before_deadline(
     deadline: Instant,
 ) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
     let turn = context.turn();
-    let session_config = match guardian_review_session_config(session.as_ref(), turn.as_ref()).await
-    {
-        Ok(session_config) => session_config,
-        Err(err) => {
-            return (
-                GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(err)),
-                GuardianReviewAnalyticsResult::without_session(),
-            );
-        }
-    };
+    let session_config =
+        match guardian_review_session_config(session.as_ref(), turn.as_ref(), Some(&request)).await
+        {
+            Ok(session_config) => session_config,
+            Err(err) => {
+                return (
+                    GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(err)),
+                    GuardianReviewAnalyticsResult::without_session(),
+                );
+            }
+        };
     let (session_outcome, session_analytics_result) = Box::pin(
         session
             .guardian_review_session

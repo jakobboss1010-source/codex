@@ -194,6 +194,7 @@ struct GuardianReviewSessionReuseKey {
     // Only include settings that affect spawned-session behavior and parent
     // history rewrites that invalidate existing reviewer context.
     parent_history_version: u64,
+    parent_turn_id: String,
     node_repl_auto_review_required: bool,
     node_repl_policy: String,
     model: Option<String>,
@@ -233,6 +234,7 @@ impl GuardianReviewSessionReuseKey {
             } else {
                 0
             },
+            parent_turn_id: String::new(),
             node_repl_auto_review_required: false,
             node_repl_policy: String::new(),
             model: spawn_config.model.clone(),
@@ -264,6 +266,11 @@ impl GuardianReviewSessionReuseKey {
             .into_keys()
             .collect::<Vec<_>>();
         self.environment_ids.sort_unstable();
+        self
+    }
+
+    fn with_parent_turn_id(mut self, parent_turn_id: &str) -> Self {
+        self.parent_turn_id = parent_turn_id.to_string();
         self
     }
 
@@ -430,7 +437,7 @@ impl GuardianReviewSessionManager {
         // Boxing breaks the Session::new -> Guardian -> Session::new future recursion.
         Box::pin(async move {
             let session_config =
-                guardian_review_session_config(&parent_session, &parent_turn).await?;
+                guardian_review_session_config(&parent_session, &parent_turn, None).await?;
             let spawn_config = session_config.spawn_config;
             let parent_history = parent_session.clone_history().await;
             let parent_compaction = spawn_config
@@ -444,6 +451,7 @@ impl GuardianReviewSessionManager {
                 parent_session.user_instructions().await,
                 parent_history.history_version(),
             )
+            .with_parent_turn_id(&parent_context.turn().sub_id)
             .with_environments(parent_context.environments())
             .with_node_repl_policy_eligibility(
                 parent_context
@@ -534,6 +542,7 @@ impl GuardianReviewSessionManager {
             params.parent_session.user_instructions().await,
             parent_history.history_version(),
         )
+        .with_parent_turn_id(&params.parent_context.turn().sub_id)
         .with_environments(params.parent_context.environments())
         .with_node_repl_policy_eligibility(
             params

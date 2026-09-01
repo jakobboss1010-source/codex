@@ -10,7 +10,9 @@ use crate::environment_selection::TurnEnvironmentState;
 use crate::guardian::approval_request::guardian_request_target_item_id;
 use crate::guardian::prompt::BUNDLED_GUARDIAN_POLICY;
 use crate::guardian::prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
+use crate::guardian::prompt::action_scoped_guardian_policy;
 use crate::guardian::prompt::guardian_policy_prompt_with_config_and_template;
+use crate::guardian::prompt::retain_current_action_envelope;
 use crate::guardian::review::guardian_review_session_config;
 use crate::guardian::review::routes_approval_to_guardian_with_reviewer;
 use crate::session::session::Session;
@@ -928,6 +930,91 @@ fn collect_guardian_transcript_entries(
     prompt::collect_guardian_context(history, node_repl_result_token_limit, &[], &[])
         .expect("collect Guardian context")
         .transcript
+}
+
+#[test]
+fn current_action_envelope_drops_old_non_authoritative_traffic() {
+    let entry = |kind, text: &str| ConversationTranscriptEntry {
+        kind,
+        text: text.to_string(),
+        original_bytes: text.len(),
+    };
+    let entries = vec![
+        entry(ConversationTranscriptEntryKind::User, "original mandate"),
+        entry(ConversationTranscriptEntryKind::Assistant, "old plan"),
+        entry(
+            ConversationTranscriptEntryKind::ToolOutput("shell".to_string()),
+            "old output",
+        ),
+        entry(
+            ConversationTranscriptEntryKind::Developer,
+            "preserved explicit approval",
+        ),
+        entry(
+            ConversationTranscriptEntryKind::User,
+            "earlier user clarification",
+        ),
+        entry(
+            ConversationTranscriptEntryKind::Assistant,
+            "superseded work",
+        ),
+        entry(ConversationTranscriptEntryKind::User, "current request"),
+        entry(ConversationTranscriptEntryKind::Assistant, "current plan"),
+        entry(
+            ConversationTranscriptEntryKind::ToolCall("shell".to_string()),
+            "current command",
+        ),
+    ];
+
+    let retained = retain_current_action_envelope(entries);
+    let retained_text = retained
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        retained_text,
+        vec![
+            "original mandate",
+            "preserved explicit approval",
+            "earlier user clarification",
+            "current request",
+            "current plan",
+            "current command",
+        ]
+    );
+}
+
+#[test]
+fn action_scoped_policy_keeps_only_matching_destination_and_general_rules() {
+    let policy = r#"## Environment Profile
+- General organization rule.
+- OpenAI route at `api.openai.com`.
+- SEC route at `www.sec.gov` and `data.sec.gov`.
+- Local runtimes are not external destinations.
+
+## Route and action boundary
+- Destination trust does not authorize a protected effect.
+"#;
+    let action = r#"{"host":"api.openai.com","method":"POST"}"#;
+
+    let scoped = action_scoped_guardian_policy(policy, action);
+
+    assert!(scoped.contains("General organization rule"));
+    assert!(scoped.contains("api.openai.com"));
+    assert!(!scoped.contains("www.sec.gov"));
+    assert!(scoped.contains("Local runtimes"));
+    assert!(scoped.contains("protected effect"));
+}
+
+#[test]
+fn action_scoped_policy_falls_back_when_destination_is_unmatched() {
+    let policy = "## Environment Profile\n- Route at `api.openai.com`.\n";
+
+    assert_eq!(
+        action_scoped_guardian_policy(policy, r#"{"host":"unknown.example"}"#),
+        policy
+    );
 }
 
 #[test]
@@ -3727,7 +3814,7 @@ async fn guardian_review_session_config_clears_context_overrides_for_distinct_ef
         .expect("turn should be unique")
         .config = Arc::new(config);
 
-    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref())
+    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref(), None)
         .await
         .expect("guardian config")
         .spawn_config;
@@ -3739,6 +3826,45 @@ async fn guardian_review_session_config_clears_context_overrides_for_distinct_ef
         ),
         (None, None)
     );
+}
+
+#[tokio::test]
+async fn guardian_review_session_config_scopes_policy_to_requested_destination() {
+    let server = start_mock_server().await;
+    let (session, mut turn) = guardian_test_session_and_turn(&server).await;
+    let mut config = (*turn.config).clone();
+    config.guardian_policy_config = Some(
+        "## Environment Profile\n- General rule.\n- OpenAI at `api.openai.com`.\n- SEC at `www.sec.gov`.\n\n## Action boundary\n- Protected effects require authority.\n"
+            .to_string(),
+    );
+    Arc::get_mut(&mut turn)
+        .expect("turn should be unique")
+        .config = Arc::new(config);
+    let request = GuardianApprovalRequest::ExecCommand {
+        id: "shell-policy-scope".to_string(),
+        command: vec![
+            "curl".to_string(),
+            "https://api.openai.com/v1/responses".to_string(),
+        ],
+        cwd: test_path_buf("/repo").abs(),
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        justification: Some("Call the approved endpoint.".to_string()),
+        tty: false,
+    };
+
+    let guardian_config =
+        guardian_review_session_config(session.as_ref(), turn.as_ref(), Some(&request))
+            .await
+            .expect("guardian config")
+            .spawn_config;
+    let base_instructions = guardian_config
+        .base_instructions
+        .expect("guardian base instructions");
+
+    assert!(base_instructions.contains("api.openai.com"));
+    assert!(!base_instructions.contains("www.sec.gov"));
+    assert!(base_instructions.contains("Protected effects require authority"));
 }
 
 #[tokio::test]
@@ -3764,7 +3890,7 @@ async fn guardian_review_session_config_preserves_context_overrides_for_same_eff
         .expect("turn should be unique")
         .config = Arc::new(config);
 
-    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref())
+    let guardian_config = guardian_review_session_config(session.as_ref(), turn.as_ref(), None)
         .await
         .expect("guardian config")
         .spawn_config;

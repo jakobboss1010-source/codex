@@ -218,6 +218,11 @@ async fn guardian_review_session_config_change_invalidates_cached_session() {
             .with_node_repl_policy_eligibility(/*required*/ true),
         "switching parent-model Node REPL eligibility must invalidate reviewer history"
     );
+    assert_ne!(
+        cached_reuse_key.clone().with_parent_turn_id("turn-a"),
+        cached_reuse_key.clone().with_parent_turn_id("turn-b"),
+        "a new parent turn must invalidate the prior action evidence envelope"
+    );
     let messages = serde_json::from_value(serde_json::json!({
         "auto_review": { "node_repl_policy": "Catalog REPL policy." }
     }))
