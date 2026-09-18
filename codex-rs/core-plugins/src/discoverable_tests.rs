@@ -156,9 +156,9 @@ async fn omits_openai_curated_but_keeps_configured_marketplaces_for_remote_codex
     write_openai_curated_marketplace(&curated_root, &["slack"]);
 
     let bundled_marketplace_name = OPENAI_BUNDLED_MARKETPLACE_NAME;
-    let bundled_marketplace_root = codex_home
-        .path()
-        .join(format!(".tmp/marketplaces/{bundled_marketplace_name}"));
+    let bundled_marketplace_root = codex_home.path().join(format!(
+        ".tmp/bundled-marketplaces/{bundled_marketplace_name}"
+    ));
     write_file(
         &bundled_marketplace_root.join(".agents/plugins/marketplace.json"),
         &format!(
@@ -179,8 +179,8 @@ async fn omits_openai_curated_but_keeps_configured_marketplaces_for_remote_codex
 plugins = true
 
 [marketplaces.{bundled_marketplace_name}]
-source_type = "git"
-source = "/tmp/{bundled_marketplace_name}"
+source_type = "local"
+source = {bundled_marketplace_root:?}
 "#
         ),
     );
@@ -240,7 +240,7 @@ async fn deduplicates_and_reprojects_cached_configured_marketplace_plugin() {
     let plugin_id = format!("{plugin_name}@{marketplace_name}");
     let marketplace_root = codex_home
         .path()
-        .join(format!(".tmp/marketplaces/{marketplace_name}"));
+        .join(format!(".tmp/bundled-marketplaces/{marketplace_name}"));
     write_file(
         &marketplace_root.join(".agents/plugins/marketplace.json"),
         &format!(
@@ -267,8 +267,8 @@ async fn deduplicates_and_reprojects_cached_configured_marketplace_plugin() {
 plugins = true
 
 [marketplaces.{marketplace_name}]
-source_type = "git"
-source = "/tmp/{marketplace_name}"
+source_type = "local"
+source = {marketplace_root:?}
 "#
         ),
     );
@@ -946,7 +946,11 @@ plugins = true
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let mut plugins = load_plugins_config(codex_home.path(), codex_home.path()).await;
     plugins.chatgpt_base_url = format!("{}/backend-api", server.uri());
-    let plugins_manager = test_plugins_manager(codex_home.path().to_path_buf());
+    let plugins_manager = test_plugins_manager_with_options(
+        codex_home.path().to_path_buf(),
+        Some(Product::Codex),
+        Some(AuthMode::Chatgpt),
+    );
     fetch_and_cache_global_remote_plugin_catalog(
         codex_home.path(),
         &RemotePluginServiceConfig::new(

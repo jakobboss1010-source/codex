@@ -158,6 +158,8 @@ struct Inner {
     notifications: std::sync::RwLock<Option<RpcNotificationSender>>,
     requests: Arc<std::sync::RwLock<Option<RpcServerRequestSender>>>,
     processes: Mutex<HashMap<ProcessId, ProcessEntry>>,
+    #[cfg(unix)]
+    shell_snapshots: crate::shell_snapshot::ShellSnapshotCache,
     telemetry: ExecServerTelemetry,
 }
 
@@ -215,6 +217,8 @@ impl LocalProcess {
                 notifications: std::sync::RwLock::new(Some(notifications)),
                 requests: Arc::new(std::sync::RwLock::new(Some(requests))),
                 processes: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                shell_snapshots: crate::shell_snapshot::ShellSnapshotCache::default(),
                 telemetry,
             }),
             runtime_paths,
@@ -332,6 +336,12 @@ impl LocalProcess {
                 let _ = notifications.try_notify(NETWORK_POLICY_DECISION_METHOD, &notification);
             }) as NetworkPolicyAuditObserver
         });
+        #[cfg(not(unix))]
+        if params.shell_snapshot.is_some() {
+            return Err(invalid_params(
+                "shell snapshots are unsupported on this platform".to_string(),
+            ));
+        }
         let prepared = prepare_exec_request(
             &params,
             child_env(&params),
@@ -340,6 +350,13 @@ impl LocalProcess {
             network_policy_audit_observer,
         )
         .await?;
+        #[cfg(unix)]
+        let mut prepared = prepared;
+        #[cfg(unix)]
+        self.inner
+            .shell_snapshots
+            .prepare(&params, &mut prepared, &self.inner.telemetry)
+            .await?;
         if prepared.command.is_empty() {
             return Err(invalid_params("argv must not be empty".to_string()));
         }
@@ -389,6 +406,7 @@ impl LocalProcess {
                 return Err(internal_error(err.to_string()));
             }
         };
+        let metrics = self.inner.telemetry.process_started(&process_id);
 
         let output_notify = Arc::new(Notify::new());
         let (wake_tx, _wake_rx) = watch::channel(0);
@@ -404,6 +422,7 @@ impl LocalProcess {
             ) {
                 drop(process_map);
                 spawned.session.terminate();
+                metrics.finish("terminated");
                 return Err(invalid_request(format!(
                     "process {process_id} start was cancelled"
                 )));
@@ -426,7 +445,7 @@ impl LocalProcess {
                     output_notify: Arc::clone(&output_notify),
                     open_streams: 2,
                     closed: false,
-                    metrics: Some(self.inner.telemetry.process_started()),
+                    metrics: Some(metrics),
                     termination_requested: false,
                     sandbox: prepared.sandbox,
                     sandbox_denied: false,
@@ -692,7 +711,7 @@ fn child_env(params: &ExecParams) -> HashMap<String, String> {
     env
 }
 
-fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolicy {
+pub(crate) fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolicy {
     ShellEnvironmentPolicy {
         inherit: env_policy.inherit.clone(),
         ignore_default_excludes: env_policy.ignore_default_excludes,
@@ -1139,6 +1158,7 @@ mod tests {
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                 .expect("cwd URI"),
+            shell_snapshot: None,
             env_policy: None,
             env,
             tty: false,
@@ -1875,7 +1895,7 @@ mod tests {
                 output_notify: Arc::clone(&output_notify),
                 open_streams: 2,
                 closed: false,
-                metrics: Some(backend.inner.telemetry.process_started()),
+                metrics: Some(backend.inner.telemetry.process_started(&process_id)),
                 termination_requested: false,
                 sandbox: SandboxType::None,
                 sandbox_denied: false,

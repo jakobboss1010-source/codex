@@ -36,7 +36,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::ProfileV2Name;
 use codex_utils_cli::SharedCliOptions;
-use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Write;
@@ -597,8 +596,16 @@ struct AppServerCommand {
 
 #[derive(Debug, Parser)]
 struct ExecServerCommand {
+    #[command(subcommand)]
+    command: Option<ExecServerSubcommand>,
+
     /// Error out when config.toml contains fields that are not recognized by this version of Codex.
-    #[arg(long = "strict-config", default_value_t = false)]
+    #[arg(
+        id = "exec_server_strict_config",
+        long = "strict-config",
+        default_value_t = false,
+        global = true
+    )]
     strict_config: bool,
 
     /// Maximum number of requests to process concurrently on each connection.
@@ -610,32 +617,57 @@ struct ExecServerCommand {
     request_dispatch_mode: codex_exec_server::RequestDispatchMode,
 
     /// Transport endpoint URL. Supported values: `ws://IP:PORT` (default), `stdio`, `stdio://`.
-    #[arg(long = "listen", value_name = "URL", conflicts_with = "remote")]
+    #[arg(
+        long = "listen",
+        value_name = "URL",
+        conflicts_with = "exec_server_remote"
+    )]
     listen: Option<String>,
 
     /// Register this exec-server as a remote environment using the given base URL.
-    #[arg(long = "remote", value_name = "URL", requires = "environment_id")]
+    #[arg(
+        long = "remote",
+        id = "exec_server_remote",
+        value_name = "URL",
+        requires = "environment_id",
+        global = true
+    )]
     remote: Option<String>,
 
     /// Environment id to attach to when registering remotely.
-    #[arg(long = "environment-id", value_name = "ID")]
+    #[arg(long = "environment-id", value_name = "ID", global = true)]
     environment_id: Option<String>,
 
     /// Human-readable environment name.
-    #[arg(long = "name", value_name = "NAME")]
+    #[arg(long = "name", value_name = "NAME", global = true)]
     name: Option<String>,
 
     /// Use Agent Identity auth from CODEX_ACCESS_TOKEN for remote registration.
-    #[arg(long = "use-agent-identity-auth", requires = "remote")]
+    #[arg(
+        long = "use-agent-identity-auth",
+        requires = "exec_server_remote",
+        global = true
+    )]
     use_agent_identity_auth: bool,
 
     /// Exit when the parent-owned standard-input pipe closes.
     #[arg(
         long = "exit-on-stdin-close",
         env = codex_exec_server::CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE_ENV_VAR,
-        requires_if("true", "remote")
+        requires_if("true", "exec_server_remote"),
+        global = true
     )]
     exit_on_stdin_close: bool,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ExecServerSubcommand {
+    /// Register an existing WebSocket exec-server as a remote environment.
+    Forward {
+        /// Destination exec-server WebSocket URL.
+        #[arg(long, value_name = "URL", requires = "exec_server_remote")]
+        connect: String,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -751,34 +783,6 @@ fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
         .map_err(|err| format!("failed to resolve socket path `{raw}`: {err}"))
 }
 
-fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
-    let is_fatal = matches!(&exit_info.exit_reason, ExitReason::Fatal(_));
-    let AppExitInfo {
-        token_usage,
-        thread_id: conversation_id,
-        resume_hint,
-        ..
-    } = exit_info;
-
-    let mut lines = Vec::new();
-    if !token_usage.is_zero() {
-        lines.push(token_usage.to_string());
-    }
-
-    if let Some(resume_cmd) = resume_hint {
-        let command = if color_enabled {
-            resume_cmd.cyan().to_string()
-        } else {
-            resume_cmd
-        };
-        lines.push(format!("To continue this session, run {command}"));
-    } else if is_fatal && let Some(conversation_id) = conversation_id {
-        lines.push(format!("Session ID: {conversation_id}"));
-    }
-
-    lines
-}
-
 /// Handle the app exit and print the results. Optionally run the update action.
 fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
     let is_fatal = match &exit_info.exit_reason {
@@ -786,12 +790,15 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
             eprintln!("ERROR: {message}");
             true
         }
-        ExitReason::UserRequested => false,
+        ExitReason::UserRequested
+        | ExitReason::Archived(_)
+        | ExitReason::TurnInterrupted
+        | ExitReason::ThreadRemoved => false,
     };
 
     let update_action = exit_info.update_action;
     let color_enabled = supports_color::on(Stream::Stdout).is_some();
-    for line in format_exit_messages(exit_info, color_enabled) {
+    for line in exit_info.format_exit_messages(color_enabled) {
         println!("{line}");
     }
     if is_fatal {
@@ -809,23 +816,30 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     println!();
     let cmd_str = action.command_str();
     println!("Updating Codex via `{cmd_str}`...");
-
     let status = {
         #[cfg(windows)]
         {
-            if action == UpdateAction::StandaloneWindows {
-                let (cmd, args) = action.command_args();
-                // Run the standalone PowerShell installer with PowerShell
-                // itself. Routing this through `cmd.exe /C` would parse
-                // PowerShell metacharacters like `|` before PowerShell sees
-                // the installer command.
-                std::process::Command::new(cmd).args(args).status()?
+            let (cmd, args) = action.command_args();
+            let cmd = if action == UpdateAction::StandaloneWindows {
+                // These args contain PowerShell metacharacters, so do not let
+                // PATHEXT select a batch shim for this action.
+                "powershell.exe"
             } else {
-                // On Windows, run via cmd.exe so .CMD/.BAT are correctly resolved (PATHEXT semantics).
-                std::process::Command::new("cmd")
-                    .args(["/C", &cmd_str])
-                    .status()?
-            }
+                cmd
+            };
+            let path_env =
+                std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
+            let command_path = resolve_windows_update_command_from_path(cmd, &path_env)?;
+            // Do not let a project-local command or package-manager config
+            // influence the updater after the user accepts the update prompt.
+            let update_cwd = tempfile::tempdir()?;
+            // Resolve through PATH without consulting the project cwd. When
+            // this returns a .cmd/.bat shim, std::process::Command routes the
+            // absolute path through the system command processor.
+            std::process::Command::new(command_path)
+                .args(args)
+                .current_dir(update_cwd.path())
+                .status()?
         }
         #[cfg(not(windows))]
         {
@@ -845,6 +859,23 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     }
     println!("\n🎉 Update ran successfully! Please restart Codex.");
     Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_windows_update_command_from_path(
+    command: &str,
+    path_env: &std::ffi::OsStr,
+) -> anyhow::Result<PathBuf> {
+    let path_env =
+        std::env::join_paths(std::env::split_paths(path_env).filter(|path| path.is_absolute()))?;
+    if path_env.is_empty() {
+        anyhow::bail!(
+            "Could not find an absolute update command `{command}` on PATH. Please update manually: https://developers.openai.com/codex/cli/"
+        );
+    }
+    which::which_in_global(command, Some(&path_env))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("could not find update command `{command}` on PATH"))
 }
 
 fn run_update_command() -> anyhow::Result<()> {
@@ -1059,25 +1090,31 @@ async fn cli_main(
     let open_agents_overview = matches!(&subcommand, Some(Subcommand::Agents(_)));
     match subcommand {
         None | Some(Subcommand::Agents(_)) => {
+            prepend_config_flags(
+                &mut interactive.config_overrides,
+                root_config_overrides.clone(),
+            );
             if open_agents_overview {
-                if !root_config_overrides.raw_overrides.is_empty()
-                    || root_strict_config
-                    || interactive.prompt.is_some()
-                    || !interactive.images.is_empty()
-                    || interactive.model.is_some()
-                    || interactive.oss
-                    || interactive.oss_provider.is_some()
-                    || interactive.config_profile_v2.is_some()
-                    || interactive.sandbox_mode.is_some()
-                    || interactive.dangerously_bypass_approvals_and_sandbox
-                    || interactive.bypass_hook_trust
-                    || interactive.cwd.is_some() && root_remote.is_none()
-                    || !interactive.add_dir.is_empty()
-                    || interactive.approval_policy.is_some()
-                    || interactive.web_search
+                if interactive.prompt.is_some() || !interactive.images.is_empty() {
+                    anyhow::bail!("`codex agents` does not accept an initial prompt or images");
+                }
+                if root_remote.is_some()
+                    && (interactive.oss
+                        || interactive.oss_provider.is_some()
+                        || !interactive.add_dir.is_empty()
+                        || interactive
+                            .config_overrides
+                            .parse_overrides()
+                            .map_err(anyhow::Error::msg)?
+                            .iter()
+                            .any(|(key, value)| {
+                                key == "sandbox_workspace_write.writable_roots"
+                                    || (key == "sandbox_workspace_write"
+                                        && value.get("writable_roots").is_some())
+                            }))
                 {
                     anyhow::bail!(
-                        "`codex agents` cannot attach to shared sessions with invocation-specific configuration overrides"
+                        "`codex agents` cannot apply local provider or additional-directory overrides to a remote server"
                     );
                 }
                 if is_workload_identity_selected() {
@@ -1095,10 +1132,6 @@ async fn cli_main(
                 }
                 interactive.agents_overview = true;
             }
-            prepend_config_flags(
-                &mut interactive.config_overrides,
-                root_config_overrides.clone(),
-            );
             let exit_info = run_interactive_tui(
                 interactive,
                 root_remote.clone(),
@@ -1146,6 +1179,9 @@ async fn cli_main(
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
         }
         Some(Subcommand::McpServer(McpServerCommand { strict_config })) => {
+            eprintln!(
+                "warning: `codex mcp-server` is deprecated and will be removed in a future release."
+            );
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
@@ -1861,14 +1897,27 @@ async fn run_exec_server_command(
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
         exec_server_telemetry::run_until_shutdown(
             async move {
-                codex_exec_server::run_remote_environment_until_shutdown(
-                    remote_config,
-                    runtime_paths,
-                    async move {
-                        let _ = shutdown_receiver.await;
-                    },
-                )
-                .await
+                let shutdown = async move {
+                    let _ = shutdown_receiver.await;
+                };
+                match cmd.command {
+                    Some(ExecServerSubcommand::Forward { connect }) => {
+                        codex_exec_server::run_remote_environment_forward_until_shutdown(
+                            remote_config,
+                            connect,
+                            shutdown,
+                        )
+                        .await
+                    }
+                    None => {
+                        codex_exec_server::run_remote_environment_until_shutdown(
+                            remote_config,
+                            runtime_paths,
+                            shutdown,
+                        )
+                        .await
+                    }
+                }
             },
             parent_lifetime,
             exec_server_telemetry::ShutdownBehavior::Graceful(shutdown_sender),
@@ -2550,7 +2599,7 @@ async fn run_interactive_tui(
             .map_err(std::io::Error::other)?;
     }
 
-    let remote_endpoint = match resolve_remote_endpoint(remote, remote_auth_token_env) {
+    let remote_endpoint = match resolve_remote_endpoint(remote, remote_auth_token_env.clone()) {
         Ok(remote_endpoint) => remote_endpoint,
         Err(err) if is_remote_auth_usage_error(&err) => {
             return Ok(AppExitInfo::fatal(err.to_string()));
@@ -2565,10 +2614,31 @@ async fn run_interactive_tui(
             remote_endpoint.clone(),
         )
     };
+    run_tui_with_recovery(start_tui, remote_auth_token_env.as_deref()).await
+}
+
+async fn run_tui_with_recovery<F, Fut>(
+    mut start_tui: F,
+    remote_auth_token_env: Option<&str>,
+) -> std::io::Result<AppExitInfo>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<AppExitInfo>>,
+{
     let mut attempted_backups = HashSet::new();
     loop {
-        let err = match start_tui().await {
-            Ok(exit_info) => return Ok(exit_info),
+        // Keep the large TUI future out of the CLI dispatcher's stack frame.
+        let err = match Box::pin(start_tui()).await {
+            Ok(mut exit_info) => {
+                if let Some(disconnect) = &mut exit_info.disconnect_info
+                    && let Some(env_var) = remote_auth_token_env
+                {
+                    disconnect
+                        .command
+                        .extend(["--remote-auth-token-env".to_string(), env_var.to_string()]);
+                }
+                return Ok(exit_info);
+            }
             Err(err) => err,
         };
         let Some(startup_error) = local_state_db::startup_error(&err) else {
@@ -2748,6 +2818,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
         strict_config,
         approval_policy,
         web_search,
+        no_alt_screen,
         prompt,
         mut config_overrides,
         ..
@@ -2767,6 +2838,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
     if web_search {
         interactive.web_search = true;
     }
+    interactive.no_alt_screen |= no_alt_screen;
     if strict_config {
         interactive.strict_config = true;
     }
@@ -2794,6 +2866,65 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_tui::TokenUsage;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn interactive_tui_future_stays_bounded() {
+        let future = run_interactive_tui(
+            TuiCli::parse_from(["codex"]),
+            /*remote*/ None,
+            /*remote_auth_token_env*/ None,
+            Arg0DispatchPaths::default(),
+        );
+        let size = std::mem::size_of_val(&future);
+
+        assert!(size < 64 * 1024, "interactive TUI future is {size} bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_command_resolution_ignores_relative_path_entries() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let decoy_dir = tempfile::tempdir_in(&cwd).expect("relative decoy directory");
+        let trusted_dir = tempfile::tempdir().expect("trusted PATH directory");
+        let relative_decoy_dir = decoy_dir
+            .path()
+            .strip_prefix(&cwd)
+            .expect("decoy directory should be relative to cwd");
+
+        for command in ["npm.cmd", "pnpm.cmd", "bun.exe"] {
+            std::fs::write(decoy_dir.path().join(command), "decoy")
+                .expect("write cwd-relative decoy");
+            std::fs::write(trusted_dir.path().join(command), "trusted")
+                .expect("write trusted PATH command");
+            let path_env = std::env::join_paths([relative_decoy_dir, trusted_dir.path()])
+                .expect("join synthetic PATH");
+
+            let resolved = resolve_windows_update_command_from_path(command, &path_env)
+                .expect("resolve update command");
+
+            assert_eq!(resolved, trusted_dir.path().join(command));
+        }
+
+        let cwd_decoy = tempfile::Builder::new()
+            .suffix(".cmd")
+            .tempfile_in(&cwd)
+            .expect("cwd-local decoy");
+        let command = cwd_decoy
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("decoy filename");
+        let relative_only_path_env = std::env::join_paths(["."]).expect("join relative-only PATH");
+        let err = resolve_windows_update_command_from_path(command, &relative_only_path_env)
+            .expect_err("relative-only PATH should not resolve a cwd command");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Could not find an absolute update command `{command}` on PATH. Please update manually: https://developers.openai.com/codex/cli/"
+            )
+        );
+    }
 
     #[tokio::test]
     async fn updater_http_client_factory_honors_respect_system_proxy() {
@@ -3604,7 +3735,11 @@ mod tests {
         AppExitInfo {
             token_usage,
             thread_id,
-            resume_hint: codex_utils_cli::resume_hint(thread_name, thread_id),
+            resume_hint: thread_id.map(|thread_id| codex_tui::ResumableThread {
+                thread_id,
+                thread_name: thread_name.map(str::to_string),
+            }),
+            disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
         }
@@ -3616,11 +3751,71 @@ mod tests {
             token_usage: TokenUsage::default(),
             thread_id: None,
             resume_hint: None,
+            disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
         };
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
         assert!(lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn format_exit_messages_preserves_auth_env_through_tui_runner() {
+        let exit_info = run_tui_with_recovery(
+            || async {
+                let mut exit_info = sample_exit_info(
+                    Some("123e4567-e89b-12d3-a456-426614174000"),
+                    /*thread_name*/ None,
+                );
+                exit_info.disconnect_info = Some(codex_tui::DisconnectInfo {
+                    command: vec![
+                        "codex".to_string(),
+                        "--remote".to_string(),
+                        "wss://example.com:443/".to_string(),
+                    ],
+                    stop_hint: "press ctrl + x".to_string(),
+                });
+                Ok(exit_info)
+            },
+            Some("CODEX_REMOTE_TOKEN"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            exit_info.format_exit_messages(/*color_enabled*/ false),
+            vec![
+                "Disconnected from this task. Any running work continues.",
+                "Reconnect: codex --remote wss://example.com:443/ --remote-auth-token-env CODEX_REMOTE_TOKEN resume 123e4567-e89b-12d3-a456-426614174000",
+                "Stop the current turn: run codex --remote wss://example.com:443/ --remote-auth-token-env CODEX_REMOTE_TOKEN agents, select this task, and press ctrl + x.",
+                "Token usage so far: total=2 input=0 output=2",
+            ]
+        );
+    }
+
+    #[test]
+    fn format_exit_messages_includes_session_id_without_resume_hint() {
+        let mut exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            /*thread_name*/ None,
+        );
+        exit_info.token_usage = TokenUsage::default();
+        exit_info.resume_hint = None;
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+        insta::assert_snapshot!(lines.join("\n"), @"Session ID: 123e4567-e89b-12d3-a456-426614174000");
+    }
+
+    #[test]
+    fn format_exit_messages_confirms_archive() {
+        let mut exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            /*thread_name*/ None,
+        );
+        exit_info.exit_reason = ExitReason::Archived(exit_info.thread_id.unwrap());
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+        insta::assert_snapshot!(lines.join("\n"), @"
+        Token usage: total=2 input=0 output=2
+        Session archived: 123e4567-e89b-12d3-a456-426614174000
+        ");
     }
 
     #[test]
@@ -3629,10 +3824,11 @@ mod tests {
             token_usage: TokenUsage::default(),
             thread_id: Some(ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap()),
             resume_hint: None,
+            disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::Fatal("boom".to_string()),
         };
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
         assert_eq!(
             lines,
             vec!["Session ID: 123e4567-e89b-12d3-a456-426614174000".to_string()]
@@ -3646,32 +3842,31 @@ mod tests {
             /*thread_name*/ None,
         );
         exit_info.exit_reason = ExitReason::Fatal("boom".to_string());
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
         assert_eq!(
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
+                "To continue this session, run:".to_string(),
+                "  codex resume 123e4567-e89b-12d3-a456-426614174000".to_string(),
             ]
         );
     }
 
     #[test]
     fn format_exit_messages_includes_resume_hint_without_color() {
-        let exit_info = sample_exit_info(
-            Some("123e4567-e89b-12d3-a456-426614174000"),
-            /*thread_name*/ None,
-        );
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
-        assert_eq!(
-            lines,
-            vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
-            ]
-        );
+        insta::allow_duplicates! {
+            for thread_name in [None, Some("")] {
+                let exit_info =
+                    sample_exit_info(Some("123e4567-e89b-12d3-a456-426614174000"), thread_name);
+                let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+                insta::assert_snapshot!(lines.join("\n"), @"
+                Token usage: total=2 input=0 output=2
+                To continue this session, run:
+                  codex resume 123e4567-e89b-12d3-a456-426614174000
+                ");
+            }
+        }
     }
 
     #[test]
@@ -3680,9 +3875,15 @@ mod tests {
             Some("123e4567-e89b-12d3-a456-426614174000"),
             /*thread_name*/ None,
         );
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ true);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("\u{1b}[36m"));
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
+        assert_eq!(
+            lines,
+            vec![
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mcodex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+            ]
+        );
     }
 
     #[test]
@@ -3691,12 +3892,29 @@ mod tests {
             Some("123e4567-e89b-12d3-a456-426614174000"),
             Some("my-thread"),
         );
-        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+        insta::assert_snapshot!(lines.join("\n"), @"
+        Token usage: total=2 input=0 output=2
+        To continue this session, run:
+          codex resume 123e4567-e89b-12d3-a456-426614174000
+        Or run codex resume and select my-thread.
+        ");
+    }
+
+    #[test]
+    fn format_exit_messages_colors_commands_and_thread_name() {
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            Some("my-thread"),
+        );
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
         assert_eq!(
             lines,
             vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume, then select my-thread (123e4567-e89b-12d3-a456-426614174000)".to_string(),
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mcodex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+                "Or run \u{1b}[36mcodex resume\u{1b}[39m and select \u{1b}[36mmy-thread\u{1b}[39m.",
             ]
         );
     }
@@ -3710,6 +3928,18 @@ mod tests {
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_and_fork_preserve_no_alt_screen() {
+        for (command, finalize) in [
+            ("resume", finalize_resume_from_args as fn(&[&str]) -> TuiCli),
+            ("fork", finalize_fork_from_args as fn(&[&str]) -> TuiCli),
+        ] {
+            assert!(finalize(&["codex", command, "--no-alt-screen"]).no_alt_screen);
+            assert!(finalize(&["codex", "--no-alt-screen", command]).no_alt_screen);
+            assert!(!finalize(&["codex", command]).no_alt_screen);
+        }
     }
 
     #[test]
@@ -4004,6 +4234,63 @@ mod tests {
     }
 
     #[test]
+    fn exec_server_forward_parses_shared_remote_options() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "exec-server",
+            "forward",
+            "--connect",
+            "ws://127.0.0.1:8765",
+            "--remote",
+            "https://example.openai.com",
+            "--environment-id",
+            "env-1",
+            "--name",
+            "forwarded",
+            "--strict-config",
+            "--use-agent-identity-auth",
+        ])
+        .expect("parse forward");
+        assert!(cli.remote.remote.is_none());
+        assert!(!cli.interactive.strict_config);
+        assert_matches!(cli.subcommand, Some(Subcommand::ExecServer(ExecServerCommand {
+            command: Some(ExecServerSubcommand::Forward { connect }),
+            remote: Some(remote),
+            environment_id: Some(environment_id),
+            name: Some(name),
+            strict_config: true,
+            use_agent_identity_auth: true,
+            ..
+        })) if connect == "ws://127.0.0.1:8765" && remote == "https://example.openai.com" && environment_id == "env-1" && name == "forwarded");
+    }
+
+    #[test]
+    fn exec_server_forward_requires_registration_and_destination() {
+        for args in [
+            vec!["forward", "--connect", "ws://127.0.0.1:8765"],
+            vec![
+                "forward",
+                "--remote",
+                "https://example.openai.com",
+                "--environment-id",
+                "env-1",
+            ],
+            vec![
+                "forward",
+                "--connect",
+                "ws://127.0.0.1:8765",
+                "--remote",
+                "https://example.openai.com",
+            ],
+        ] {
+            assert!(
+                MultitoolCli::try_parse_from(["codex", "exec-server"].into_iter().chain(args))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn root_strict_config_is_supported_for_exec_server() {
         let cli = MultitoolCli::try_parse_from(["codex", "--strict-config", "exec-server"])
             .expect("parse");
@@ -4226,35 +4513,6 @@ mod tests {
     }
 
     #[test]
-    fn app_server_code_mode_host_url_parses_independently_of_listen_transport() {
-        let app_server = app_server_from_args(
-            [
-                "codex",
-                "app-server",
-                "--code-mode-host",
-                "wss://example.test/code-mode",
-                "--listen",
-                "ws://127.0.0.1:4500",
-            ]
-            .as_ref(),
-        );
-
-        assert_eq!(
-            app_server.code_mode_host.code_mode_host,
-            Some(
-                url::Url::parse("wss://example.test/code-mode")
-                    .expect("test endpoint should parse")
-            )
-        );
-        assert_eq!(
-            app_server.listen,
-            codex_app_server::AppServerTransport::WebSocket {
-                bind_address: "127.0.0.1:4500".parse().expect("valid socket address"),
-            }
-        );
-    }
-
-    #[test]
     fn app_server_grpc_code_mode_host_url_parses_independently_of_listen_transport() {
         let app_server = app_server_from_args(
             [
@@ -4279,7 +4537,13 @@ mod tests {
         for endpoint in [
             "ftp://127.0.0.1:8765",
             "ws://",
+            "ws://127.0.0.1:8765",
+            "wss://example.test/code-mode",
+            "ws://alice:secret@example.test/code-mode",
+            "wss://alice:secret@example.test/code-mode",
             "wss://example.test/code-mode#fragment",
+            "http://",
+            "https://example.test/#fragment",
             "https://example.test/code-mode",
             "http://alice:secret@example.test",
             "https://alice:secret@example.test",
